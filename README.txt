@@ -1,5 +1,7 @@
-ActiveFormspecs Mod v2.2
+ActiveFormspecs Mod v3.0a (Build 06)
 By Leslie E. Krause
+
+*** NOTE: This is an alpha version and is made available for testing purposes only! ***
 
 ActiveFormspecs is a self-contained API that provides secure session tracking, session-
 based state tables, and localized event handling of formspecs for individual mods as 
