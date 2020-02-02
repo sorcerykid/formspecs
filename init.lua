@@ -1,13 +1,13 @@
 --------------------------------------------------------
--- Minetest :: ActiveFormspecs Mod v2.4 (formspecs)
+-- Minetest :: ActiveFormspecs Mod v2.6 PRERELEASE
 --
 -- See README.txt for licensing and release notes.
--- Copyright (c) 2016-2018, Leslie Ellen Krause
+-- Copyright (c) 2016-2019, Leslie Ellen Krause
 --
 -- ./games/just_test_tribute/mods/formspecs/init.lua
 --------------------------------------------------------
 
-print( "Loading ActiveFormspecs Mod" )
+print( "Loading ActiveFormspecs Mod (PRERELEASE)" )
 
 minetest.FORMSPEC_SIGEXIT = "true"	-- player clicked exit button or pressed esc key (boolean for backward compatibility)
 minetest.FORMSPEC_SIGQUIT = 1		-- player logged off
@@ -15,6 +15,9 @@ minetest.FORMSPEC_SIGKILL = 2		-- player was killed
 minetest.FORMSPEC_SIGTERM = 3		-- server is shutting down
 minetest.FORMSPEC_SIGPROC = 4		-- procedural closure
 minetest.FORMSPEC_SIGTIME = 5		-- timeout reached
+minetest.FORMSPEC_SIGSTOP = 6		-- procedural closure (cannot be trapped)
+minetest.FORMSPEC_SIGHOLD = 7		-- child form opened, parent is suspended
+minetest.FORMSPEC_SIGCONT = 8		-- child form closed, parent can continue
 
 local afs = { }		-- obtain localized, protected namespace
 
@@ -39,6 +42,7 @@ end
 -- trigger callbacks at set intervals within timer queue
 -----------------------------------------------------------------
 
+local yy = 0
 do
 	-- localize needed object references for efficiency
 	local get_us_time = minetest.get_us_time
@@ -62,6 +66,7 @@ do
 	end
 
 	minetest.register_globalstep( function( dtime )
+--local x = get_us_time( )
 		local curtime = step_clock( ) / 1000000
 		local idx = #timers
 
@@ -81,6 +86,7 @@ do
       		        	end
 			idx = idx - 1
         	end
+--yy = yy + ( get_us_time( ) - x )
 	end )
 end
 
@@ -89,13 +95,13 @@ end
 -----------------------------------------------------------------
 
 local on_rightclick = function( pos, node, player )
-	-- should be passing meta to on_open( ) and on_close( ) as first param?
-	-- local meta = { pos = pos, node = node }
-	local formspec = minetest.registered_nodes[ node.name ].on_open( pos, player )
+	local nodedef = minetest.registered_nodes[ node.name ]
+	local meta = nodedef.before_open and nodedef.before_open( pos, node, player ) or pos
+	local formspec = nodedef.on_open( meta, player )
 
 	if formspec then
 		local player_name = player:get_player_name( )
-		minetest.create_form( pos, player_name, formspec, minetest.registered_nodes[ node.name ].on_close )
+		minetest.create_form( meta, player_name, formspec, nodedef.on_close )
 		afs.forms[ player_name ].origin = node.name
 	end
 end
@@ -127,7 +133,14 @@ minetest.register_on_player_receive_fields( function( player, formname, fields )
 
 	-- perform a basic sanity check, since these shouldn't technically occur
 	if not form or player ~= form.player or formname ~= form.name then return end
-	
+
+	-- handle reverse-lookups of dropdown indexes
+	for name, keys in pairs( form.dropdowns ) do
+		if fields[ name ] then
+			fields[ name ] = keys[ fields[ name ] ]
+		end
+	end
+
 	form.newtime = os.time( )
 	form.on_close( form.meta, form.player, fields )
 
@@ -136,7 +149,18 @@ minetest.register_on_player_receive_fields( function( player, formname, fields )
 		minetest.get_form_timer( player_name ).stop( )
 
 		afs.stats:on_close( )
-		afs.forms[ player_name ] = nil
+		if form.parent_form then
+			-- restore previous session
+			form = form.parent_form
+			afs.forms[ player_name ] = form
+
+			-- delay a single tick to ensure formspec updates are handled by client
+			minetest.after( 0.0, function ( )
+				form.on_close( form.meta, form.player, { quit = minetest.FORMSPEC_SIGCONT } )
+			end )
+		else
+			afs.forms[ player_name ] = nil
+		end
 	end
 end )
 
@@ -186,38 +210,43 @@ minetest.get_form_timer = function ( player_name, form_name )
 end
 
 -----------------------------------------------------------------
--- open detached formspec with session-based state table
+-- parse specialized formspec elements and escapes codes
 -----------------------------------------------------------------
 
-minetest.create_form = function ( meta, player_name, formspec, on_close )
-	-- short circuit whenever required params are missing
-	if not player_name or not formspec or not on_close then return end
+local function escape( str )
+	return string.gsub( str, "\\.",
+		{ ["\\%]"] = "\\x5D", ["\\%["] = "\\x5B", ["\\,"] = "\\x2C", ["\\;"] = "\\x3B" } )
+end
 
-	if type( player_name ) ~= "string" then
-		player_name = player_name:get_player_name( )
-	end
+local function unescape( str, is_raw )
+	return string.gsub( str, "\\x..",
+		{ ["\\x5D"] = "\\]", ["\\x5B"] = "\\[", ["\\x2C"] = "\\,", ["\\x3B"] = "\\;" } )
+end
 
-	local form = afs.forms[ player_name ]
+local function unescape_raw( str, is_raw )
+	return string.gsub( str, "\\x..",
+		{ ["\\x5D"] = "]", ["\\x5B"] = "[", ["\\x2C"] = ",", ["\\x3B"] = ";" } )
+end
 
-	-- trigger previous callback before formspec closure
-	if form then
-		minetest.get_form_timer( player_name, form.name ).stop( )
-		form.on_close( form.meta, form.player, { quit = minetest.FORMSPEC_SIGPROC } )
-		afs.stats:on_close( )
-	end
+local function parse_elements( form, formspec )
+	formspec = escape( formspec )
+	form.dropdowns = { }	-- reset the dropdown lookup
 
-	-- start new session when opening formspec
-	afs.session_id = afs.session_id + 1
+	-- dropdown elements can optionally return the selected
+        -- index rather than the value of the option itself
+	formspec = string.gsub( formspec, "dropdown%[(.-;.-;(.-);(.-);.-);(.-)%]", function( prefix, name, options, use_index )
+		if use_index == "true" then
+			form.dropdowns[ name ] = { }
 
-	form = { }
-	form.id = afs.session_id
-	form.name = minetest.get_password_hash( player_name, afs.session_seed + afs.session_id )
-	form.player = minetest.get_player_by_name( player_name )
-	form.origin = string.match( debug.getinfo( 2 ).source, "^@.*[/\\]mods[/\\](.-)[/\\]" ) or "?"
-	form.on_close = on_close
-	form.meta = meta or { }
-	form.oldtime = math.floor( afs.get_uptime( ) )
-	form.newtime = form.oldtime
+			for idx, val in ipairs( string.split( options, ",", true ) ) do
+				form.dropdowns[ name ][ unescape_raw( val ) ] = idx     -- add to reverse lookup table
+			end
+
+		elseif use_index ~= "" and use_index ~= "false" then
+			return ""       -- strip invalid elements
+		end
+		return string.format( "dropdown[%s]", prefix )
+	end )
 
 	-- hidden elements only provide default, initial values 
 	-- for state table and are always stripped afterward
@@ -239,9 +268,51 @@ minetest.create_form = function ( meta, player_name, formspec, on_close )
 		return ""	-- strip hidden elements prior to showing formspec
 	end )
 
+	return unescape( formspec )
+end
+
+-----------------------------------------------------------------
+-- open detached formspec with session-based state table
+-----------------------------------------------------------------
+
+minetest.create_form = function ( meta, player_name, formspec, on_close, signal )
+	-- short circuit whenever required params are missing
+	if not player_name or not formspec then return end
+
+	if type( player_name ) ~= "string" then
+		player_name = player_name:get_player_name( )
+	end
+
+	local form = afs.forms[ player_name ]
+
+	-- trigger previous callback before formspec closure
+	if form then
+		minetest.get_form_timer( player_name, form.name ).stop( )
+		if signal ~= minetest.FORMSPEC_SIGSTOP then
+			form.on_close( form.meta, form.player, { quit = signal or minetest.FORMSPEC_SIGPROC } )
+		end
+		if signal ~= minetest.FORMSPEC_SIGHOLD then
+			form = nil
+			afs.stats:on_close( )
+		end
+	end
+
+	-- start new session when opening formspec
+	afs.session_id = afs.session_id + 1
+
+	form = { parent_form = form }
+	form.id = afs.session_id
+	form.name = minetest.get_password_hash( player_name, afs.session_seed + afs.session_id )
+	form.player = minetest.get_player_by_name( player_name )
+	form.origin = string.match( debug.getinfo( 2 ).source, "^@.*[/\\]mods[/\\](.-)[/\\]" ) or "?"
+	form.on_close = on_close or function ( ) end
+	form.meta = meta or { }
+	form.oldtime = math.floor( afs.get_uptime( ) )
+	form.newtime = form.oldtime
+
 	afs.forms[ player_name ] = form
 	afs.stats:on_open( )
-	minetest.show_formspec( player_name, form.name, formspec )
+	minetest.show_formspec( player_name, form.name, parse_elements( form, formspec ) )
 
 	return form.name
 end
@@ -251,11 +322,12 @@ minetest.update_form = function ( player, formspec )
 	local form = afs.forms[ pname ]
 
 	if form then
-		minetest.show_formspec( pname, form.name, formspec )
+		form.oldtime = math.floor( afs.get_uptime( ) )
+		minetest.show_formspec( pname, form.name, parse_elements( form, formspec ) )
 	end
 end
 
-minetest.destroy_form = function ( player )
+minetest.destroy_form = function ( player, signal )
 	local pname = type( player ) == "string" and player or player:get_player_name( )
 	local form = afs.forms[ pname ]
 
@@ -263,7 +335,9 @@ minetest.destroy_form = function ( player )
 		minetest.close_formspec( pname, form.name )
 		minetest.get_form_timer( pname ):stop( )
 
-		form.on_close( form.meta, form.player, { quit = minetest.FORMSPEC_SIGPROC } )
+		if signal ~= minetest.FORMSPEC_SIGSTOP then
+			form.on_close( form.meta, form.player, { quit = signal or minetest.FORMSPEC_SIGPROC } )
+		end
 
 		afs.stats:on_close( )
 		afs.forms[ pname ] = nil
@@ -322,7 +396,7 @@ end )
 
 minetest.register_chatcommand( "fs", {
         description = "Display realtime information about form sessions",
-	privs = { server = true },
+--	privs = { server = true },
         func = function( pname, param )
 		local page_idx = 1
 		local page_size = 10
@@ -343,7 +417,7 @@ minetest.register_chatcommand( "fs", {
 				.. default.gui_bg
 				.. default.gui_bg_img
 
-				.. "label[0.1,6.7;ActiveFormspecs v2.4]"
+				.. "label[0.1,6.7;ActiveFormspecs v2.4" .. string.format( "%0.4f", yy / 1000000 ).. "]"
 				.. string.format( "label[0.1,0.0;%s]label[0.1,0.5;%d min %02d sec]",
 					minetest.colorize( "#888888", "uptime:" ), math.floor( uptime / 60 ), uptime % 60 )
 				.. string.format( "label[5.6,0.0;%s]label[5.6,0.5;%d]",
