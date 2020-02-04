@@ -1,5 +1,5 @@
 --------------------------------------------------------
--- Minetest :: ActiveFormspecs Mod v2.6 PRERELEASE
+-- Minetest :: ActiveFormspecs Mod v2.6 (formspecs)
 --
 -- See README.txt for licensing and release notes.
 -- Copyright (c) 2016-2019, Leslie Ellen Krause
@@ -7,7 +7,7 @@
 -- ./games/just_test_tribute/mods/formspecs/init.lua
 --------------------------------------------------------
 
-print( "Loading ActiveFormspecs Mod (PRERELEASE)" )
+print( "Loading ActiveFormspecs Mod" )
 
 minetest.FORMSPEC_SIGEXIT = "true"	-- player clicked exit button or pressed esc key (boolean for backward compatibility)
 minetest.FORMSPEC_SIGQUIT = 1		-- player logged off
@@ -213,9 +213,16 @@ end
 -- parse specialized formspec elements and escapes codes
 -----------------------------------------------------------------
 
+local _ 
+local function is_match( str, pat )
+        -- use array for captures
+        _ = { string.match( str, pat ) }
+        return #_ > 0 and _ or nil
+end
+
 local function escape( str )
 	return string.gsub( str, "\\.",
-		{ ["\\%]"] = "\\x5D", ["\\%["] = "\\x5B", ["\\,"] = "\\x2C", ["\\;"] = "\\x3B" } )
+		{ ["\\]"] = "\\x5D", ["\\["] = "\\x5B", ["\\,"] = "\\x2C", ["\\;"] = "\\x3B" } )
 end
 
 local function unescape( str, is_raw )
@@ -234,39 +241,49 @@ local function parse_elements( form, formspec )
 
 	-- dropdown elements can optionally return the selected
         -- index rather than the value of the option itself
-	formspec = string.gsub( formspec, "dropdown%[(.-;.-;(.-);(.-);.-);(.-)%]", function( prefix, name, options, use_index )
-		if use_index == "true" then
-			form.dropdowns[ name ] = { }
+	formspec = string.gsub( formspec, "dropdown%[(.-)%]", function( params )
+		if is_match( params, "^([^;]*;[^;]*;([^;]*);([^;]*);[^;]*);([^;]*)$" ) then
+			local prefix = _[ 1 ]
+			local name = _[ 2 ]
+			local options = _[ 3 ]
+			local use_index = _[ 4 ]
 
-			for idx, val in ipairs( string.split( options, ",", true ) ) do
-				form.dropdowns[ name ][ unescape_raw( val ) ] = idx     -- add to reverse lookup table
+			if use_index == "true" then
+				form.dropdowns[ name ] = { }
+				for idx, val in ipairs( string.split( options, ",", true ) ) do
+					form.dropdowns[ name ][ unescape_raw( val ) ] = idx     -- add to reverse lookup table
+				end
+				return string.format( "dropdown[%s]", prefix )
+			elseif use_index == "false" or use_index == "" then
+				return string.format( "dropdown[%s]", prefix )
+			else
+				return ""	-- strip invalid dropdown elements
 			end
-
-		elseif use_index ~= "" and use_index ~= "false" then
-			return ""       -- strip invalid elements
-		end
-		return string.format( "dropdown[%s]", prefix )
+                end
+		return string.format( "dropdown[%s]", params )
 	end )
 
 	-- hidden elements only provide default, initial values 
 	-- for state table and are always stripped afterward
-	formspec = string.gsub( formspec, "hidden%[(.-);(.-)%]", function( key, value )
-		if form.meta[ key ] == nil then
-			local data, type = string.match( value, "^(.-);(.-)$" )
+	formspec = string.gsub( formspec, "hidden%[(.-)%]", function( params )
+		if is_match( params, "^([^;]*);([^;]*)$" ) or is_match( params, "^([^;]*);([^;]*);([^;]*)$" ) then
+			local key = _[ 1 ]
+			local value = _[ 2 ]
+			local type = _[ 3 ]
 
-			-- parse according to specified data type
-			if type == "string" or type == "" then
-				form.meta[ key ] = data
-			elseif type == "number" then
-				form.meta[ key ] = tonumber( data )
-			elseif type == "boolean" then
-				form.meta[ key ] = ( { ["1"] = true, ["0"] = false, ["true"] = true, ["false"] = false } )[ data ]
-			elseif type == nil then
-				form.meta[ key ] = value	-- default to string, if no data type specified
+			if key ~= "" and form.meta[ key ] == nil then
+				-- parse according to specified data type
+				if type == "string" or type == "" or type == nil then
+					form.meta[ key ] = unescape_raw( value )
+				elseif type == "number" then
+					form.meta[ key ] = tonumber( value )
+				elseif type == "boolean" then
+					form.meta[ key ] = ( { ["1"] = true, ["0"] = false, ["true"] = true, ["false"] = false } )[ value ]
+				end
 			end
 		end
-		return ""	-- strip hidden elements prior to showing formspec
-	end )
+		return ""       -- strip hidden elements prior to showing formspec
+        end )
 
 	return unescape( formspec )
 end
